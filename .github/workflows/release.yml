@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+# Actions are pinned to a commit, because they can read the signing key and write releases.
+permissions:
+  contents: write
+
+jobs:
+  # Never replaces the files of a published release. Publishing a draft creates its tag, which starts this workflow again.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.check.outputs.published }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v$(jq -r .version app/package.json)"
+          published=$(gh release list --limit 1000 --json tagName,isDraft | jq --arg t "$tag" 'any(.[]; .tagName == $t and (.isDraft | not))')
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          if [ "$published" = true ]; then echo "::notice::$tag is already published. Raise the version to release again."; fi
+
+  build:
+    needs: guard
+    if: needs.guard.outputs.published == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Linux system packages
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: app/src-tauri
+
+      - run: npm ci
+        working-directory: app
+
+      - name: Rust tests
+        run: cargo test
+        working-directory: app/src-tauri
+
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          tagName: v__VERSION__
+          releaseName: SAP GUI Launcher v__VERSION__
+          releaseBody: Install steps are in the README.
+          releaseDraft: true
+          # The three builds overwrite each other's latest.json, so the finish job writes it.
+          includeUpdaterJson: false
+
+  # Runs on the uploaded files, because GitHub and tauri-action rename them (spaces become dots).
+  finish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Upload latest.json and SHA-256 checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r .version app/package.json)
+          mkdir assets
+          gh release download "v$version" --dir assets
+          cd assets
+          rm -f latest.json ./*.sha256
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ../.github/latest-json.sh "$version" . > latest.json
+          gh release upload "v$version" latest.json ./*.sha256 --clobber --repo "$GITHUB_REPOSITORY"
